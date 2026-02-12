@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AprilTag Web Detector (WASM)</title>
+  <style>
+    body { margin: 0; font-family: system-ui, Arial; background: #0b0b0b; color: #fff; }
+    .wrap { display: grid; grid-template-columns: 1fr; gap: 12px; padding: 12px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    video, canvas { width: 100%; max-width: 720px; border-radius: 12px; background: #111; }
+    .panel { max-width: 720px; background: #111; padding: 12px; border-radius: 12px; }
+    label { display:inline-flex; gap: 8px; align-items:center; }
+    input { width: 140px; padding: 6px; border-radius: 8px; border: 1px solid #333; background: #0f0f0f; color: #fff; }
+    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #333; background: #1a1a1a; color: #fff; cursor: pointer; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
+    .hint { opacity: .8; font-size: 12px; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="row">
+      <button id="btnStart">Start camera</button>
+      <button id="btnStop" disabled>Stop</button>
+
+      <label>
+        Tag size (meters)
+        <input id="tagSize" type="number" step="0.01" value="0.16" />
+      </label>
+
+      <label>
+        Target Tag ID (for pose)
+        <input id="tagId" type="number" step="1" value="0" />
+      </label>
+
+      <label>
+        Detect every N frames
+        <input id="detectEvery" type="number" step="1" value="3" min="1" />
+      </label>
+
+      <label>
+        Target width (px)
+        <input id="targetW" type="number" step="1" value="640" min="160" />
+      </label>
+    </div>
+
+    <!-- Video can be hidden if you want only one view -->
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+
+    <div class="panel">
+      <div class="hint">
+        • Canvas may look like a “screenshot” if detection is heavy. This version keeps canvas smooth by skipping frames, reusing buffers, and preventing overlapping detect calls.<br>
+        • Pose needs camera intrinsics; we estimate them (OK for demos, rough for measurement).
+      </div>
+      <hr style="border:0;border-top:1px solid #222;margin:12px 0">
+      <pre id="out">Idle.</pre>
+    </div>
+  </div>
+
+  <!-- apriltag_wasm.js must be in the same folder -->
+  <script src="./apriltag_wasm.js"></script>
+  <script>
+    const video  = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const out    = document.getElementById('out');
+
+    const btnStart = document.getElementById('btnStart');
+    const btnStop  = document.getElementById('btnStop');
+
+    const tagSizeEl     = document.getElementById('tagSize');
+    const tagIdEl       = document.getElementById('tagId');
+    const detectEveryEl = document.getElementById('detectEvery');
+    const targetWEl     = document.getElementById('targetW');
+
+    let ctx = null;
+    let stream = null;
+    let apriltag = null;
+
+    let running = false;
+    let detecting = false;
+
+    let frameCount = 0;
+    let lastDetections = [];
+
+    // Reused buffers (avoid allocations each frame)
+    let gray = null;
+    let imgData = null;
+
+    function estimateIntrinsics(w, h) {
+      // Rough browser intrinsics estimate (demo-quality).
+      // If you know device FOV, you can improve this.
+      const fx = w;
+      const fy = w;
+      const cx = w / 2;
+      const cy = h / 2;
+      return { fx, fy, cx, cy };
+    }
+
+    function drawDetection(det) {
+      const c = det.corners;
+
+      ctx.beginPath();
+      ctx.moveTo(c[0].x, c[0].y);
+      ctx.lineTo(c[1].x, c[1].y);
+      ctx.lineTo(c[2].x, c[2].y);
+      ctx.lineTo(c[3].x, c[3].y);
+      ctx.closePath();
+
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "lime";
+      ctx.stroke();
+
+      ctx.fillStyle = "lime";
+      ctx.font = "18px system-ui";
+      ctx.fillText(`ID ${det.id}`, det.center.x + 6, det.center.y - 6);
+    }
+
+    function toGrayscaleRGBA(p, grayBuf) {
+      // Weighted luminance is a bit better than averaging and still fast.
+      for (let i = 0, j = 0; i < p.length; i += 4, j++) {
+        grayBuf[j] = (p[i] * 0.299 + p[i+1] * 0.587 + p[i+2] * 0.114) | 0;
+      }
+    }
+
+    function getMethods(obj) {
+      if (!obj) return [];
+      const proto = Object.getPrototypeOf(obj);
+      return Array.from(new Set([
+        ...Object.getOwnPropertyNames(obj),
+        ...(proto ? Object.getOwnPropertyNames(proto) : [])
+      ])).sort();
+    }
+
+    async function runDetect(detector, grayBuf, w, h) {
+      // Try common method names
+      if (typeof detector.detect === "function") return await detector.detect(grayBuf, w, h);
+      if (typeof detector.detectTags === "function") return await detector.detectTags(grayBuf, w, h);
+      if (typeof detector.detect_async === "function") return await detector.detect_async(grayBuf, w, h);
+      if (typeof detector.run === "function") return await detector.run(grayBuf, w, h);
+
+      throw new Error("No detect method found. Methods: " + getMethods(detector).join(", "));
+    }
+
+    async function createAprilTagDetector() {
+      // Pattern A: AprilTagWasm is a factory that returns (or resolves to) a detector
+      try {
+        const maybe = AprilTagWasm();
+        const det = (maybe && typeof maybe.then === "function") ? await maybe : maybe;
+        if (det) return det;
+      } catch (e) {}
+
+      // Pattern B: AprilTagWasm is a constructor (class/function)
+      try {
+        const det = new AprilTagWasm();
+        if (typeof det.init === "function") await det.init();
+        if (typeof det.ready === "function") await det.ready();
+        return det;
+      } catch (e) {}
+
+      // Pattern C: AprilTagWasm is a module object with nested constructor
+      try {
+        if (AprilTagWasm && typeof AprilTagWasm.AprilTagWasm === "function") {
+          const det = new AprilTagWasm.AprilTagWasm();
+          if (typeof det.init === "function") await det.init();
+          if (typeof det.ready === "function") await det.ready();
+          return det;
+        }
+      } catch (e) {}
+
+      // Pattern D: static create()
+      try {
+        if (AprilTagWasm && typeof AprilTagWasm.create === "function") {
+          return await AprilTagWasm.create();
+        }
+      } catch (e) {}
+
+      throw new Error("Unsupported AprilTagWasm export shape. We need to inspect its API.");
+    }
+
+    function setCanvasToTargetWidth() {
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+
+      const targetW = Math.max(160, Number(targetWEl.value || 640));
+      const scale = targetW / vw;
+
+      canvas.width = targetW;
+      canvas.height = Math.round(vh * scale);
+
+      // Reset reusable buffers
+      gray = new Uint8Array(canvas.width * canvas.height);
+      imgData = null;
+    }
+
+    function stopAll() {
+      running = false;
+      detecting = false;
+      frameCount = 0;
+      lastDetections = [];
+
+      if (video) {
+        video.pause();
+        video.srcObject = null;
+      }
+      if (stream) {
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      out.textContent = "Stopped.";
+    }
+
+    async function loop() {
+      if (!running) return;
+
+      // Always draw live video to canvas (smooth UI)
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // Draw last known detections (even if we skip detection this frame)
+      for (const det of lastDetections) {
+        drawDetection(det);
+      }
+
+      // Detect only every N frames and never overlap detections
+      const detectEvery = Math.max(1, Number(detectEveryEl.value || 3));
+      frameCount++;
+
+      const shouldDetectThisFrame = (frameCount % detectEvery === 0) && !detecting;
+
+      if (shouldDetectThisFrame) {
+        detecting = true;
+
+        try {
+          // Get pixels (reuse ImageData container when possible)
+          imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const p = imgData.data;
+
+          if (!gray || gray.length !== canvas.width * canvas.height) {
+            gray = new Uint8Array(canvas.width * canvas.height);
+          }
+          toGrayscaleRGBA(p, gray);
+
+          // Update tag size and camera info for pose
+          const tagId = Number(tagIdEl.value || 0);
+          const tagSize = Number(tagSizeEl.value || 0.16);
+
+          if (typeof apriltag.set_tag_size === "function") {
+            apriltag.set_tag_size(tagId, tagSize);
+          }
+
+          const { fx, fy, cx, cy } = estimateIntrinsics(canvas.width, canvas.height);
+          if (typeof apriltag.set_camera_info === "function") {
+            apriltag.set_camera_info(fx, fy, cx, cy);
+          }
+
+          // Run detector
+          const ret = await runDetect(apriltag, gray, canvas.width, canvas.height);
+          lastDetections = normalizeDetections(ret);
+
+          // Update text output (do this only when new detections computed)
+          let lines = [];
+          lines.push(`Detections: ${Array.isArray(lastDetections) ? lastDetections.length : 0}`);
+          for (const det of lastDetections) {
+            if (det.pose && det.pose.t) {
+              const tx = det.pose.t[0], ty = det.pose.t[1], tz = det.pose.t[2];
+              const distance = Math.sqrt(tx*tx + ty*ty + tz*tz);
+              lines.push(`ID ${det.id} | t=[${tx.toFixed(3)}, ${ty.toFixed(3)}, ${tz.toFixed(3)}] m | dist=${distance.toFixed(3)} m`);
+            } else {
+              lines.push(`ID ${det.id} | pose not available`);
+            }
+          }
+          out.textContent = lines.join("\n");
+        } catch (err) {
+          console.error(err);
+          out.textContent = "Detect error: " + (err?.message || err);
+        } finally {
+          detecting = false;
+        }
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    btnStart.addEventListener('click', async () => {
+      if (running) return;
+
+      try {
+        out.textContent = "Initializing detector (WASM)…";
+        apriltag = await createAprilTagDetector();
+
+        out.textContent = "Starting camera…";
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false
+        });
+
+        video.srcObject = stream;
+        await video.play();
+
+        // Setup canvas and context
+        setCanvasToTargetWidth();
+        ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+        running = true;
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+
+        out.textContent = "Running… point at a tag.";
+        loop();
+      } catch (err) {
+        console.error(err);
+        out.textContent = "Error: " + (err?.message || err);
+        stopAll();
+      }
+    });
+
+    btnStop.addEventListener('click', () => stopAll());
+
+    function normalizeDetections(ret) {
+        if (!ret) return [];
+
+        // already an array
+        if (Array.isArray(ret)) return ret;
+
+        // common wrappers
+        if (Array.isArray(ret.detections)) return ret.detections;
+        if (Array.isArray(ret.results)) return ret.results;
+        if (Array.isArray(ret.tags)) return ret.tags;
+        if (Array.isArray(ret.out)) return ret.out;
+
+        // some return a single object
+        if (ret.id !== undefined && ret.corners) return [ret];
+
+        return [];
+    }
+  </script>
+</body>
+</html>
