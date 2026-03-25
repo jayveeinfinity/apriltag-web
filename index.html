@@ -15,6 +15,19 @@
     button { padding: 10px 12px; border-radius: 10px; border: 1px solid #333; background: #1a1a1a; color: #fff; cursor: pointer; }
     pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
     .hint { opacity: .8; font-size: 12px; line-height: 1.4; }
+    #detectionIndicator {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #333;
+      margin-right: 8px;
+      transition: background 0.2s;
+    }
+    #detectionIndicator.active {
+      background: lime;
+      box-shadow: 0 0 10px lime;
+    }
   </style>
 </head>
 <body>
@@ -42,6 +55,11 @@
         Target width (px)
         <input id="targetW" type="number" step="1" value="640" min="160" />
       </label>
+
+      <div style="margin-left: auto; display: flex; align-items: center; background: #1a1a1a; padding: 6px 12px; border-radius: 20px;">
+        <span id="detectionIndicator"></span>
+        <span id="detectionStatus" style="font-size: 14px; font-weight: 500;">No Tag</span>
+      </div>
     </div>
 
     <!-- Video can be hidden if you want only one view -->
@@ -82,6 +100,24 @@
 
     let frameCount = 0;
     let lastDetections = [];
+
+    /**
+     * CUSTOM CALLBACK: This function is executed when AprilTags are detected.
+     * You can modify this function to perform any action on detection.
+     */
+    function onAprilTagDetected(detections) {
+      // Example: Log IDs to console
+      // console.log("Detected Tag IDs:", detections.map(d => d.id).join(", "));
+      
+      // The USER can add their custom function call here
+      myCustomFunction(detections);
+    }
+
+    function myCustomFunction(detections) {
+      // Placeholder for user's logic
+      const ids = detections.map(d => d.id).join(", ");
+      // Example action: updating a status or triggering an external API
+    }
 
     // Reused buffers (avoid allocations each frame)
     let gray = null;
@@ -259,6 +295,21 @@
           // Run detector
           const ret = await runDetect(apriltag, gray, canvas.width, canvas.height);
           lastDetections = normalizeDetections(ret);
+
+          // Update Detection UI and trigger callback
+          const indicator = document.getElementById('detectionIndicator');
+          const statusText = document.getElementById('detectionStatus');
+          
+          if (lastDetections.length > 0) {
+            indicator.classList.add('active');
+            statusText.textContent = `Detected ID: ${lastDetections.map(d => d.id).join(", ")}`;
+            
+            // Execute the callback function
+            onAprilTagDetected(lastDetections);
+          } else {
+            indicator.classList.remove('active');
+            statusText.textContent = "No Tag";
+          }
 
           // Update text output (do this only when new detections computed)
           let lines = [];
